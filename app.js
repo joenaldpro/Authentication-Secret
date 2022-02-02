@@ -4,13 +4,28 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const ejs = require("ejs");
 const mongoose = require("mongoose");
-const encrypt = require("mongoose-encryption");
+
+// Authenticating using Google
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+const findOrCreate = require("mongoose-findorcreate");
+// Security
+const session = require("express-session");
+const passport = require("passport");
+const passportLocalMongoose = require("passport-local-mongoose");
 
 const app = express();
 
 app.set("view engine", "ejs");
 app.use(bodyParser.urlencoded({extended: true}));
 app.use(express.static("public"));
+
+app.use(session({
+  secret: "Our little secret.",
+  resave: false,
+  saveUninitialized: false,
+}));
+app.use(passport.initialize());
+app.use(passport.session());
 
 // Database connection
 mongoose.connect("mongodb://localhost:27017/usersDB", {useNewUrlParser: true});
@@ -19,67 +34,154 @@ mongoose.connect("mongodb://localhost:27017/usersDB", {useNewUrlParser: true});
 const userSchema = new mongoose.Schema({
   email: String,
   password: String,
+  googleId: String,
+  secret: String,
 });
-
-// need to add plugin to the schema before model
-
-userSchema.plugin(encrypt, {secret: process.env.SECRET, encryptedFields: ["password"]});
-
+userSchema.plugin(passportLocalMongoose);
+userSchema.plugin(findOrCreate);
 
 // Create Database Model
 const User = new mongoose.model("User", userSchema);
 
 
+passport.use(User.createStrategy());
+passport.serializeUser(function(user, done){
+  done(null, user.id);
+});
+passport.deserializeUser(function(id, done){
+  User.findById(id, function(err, user){
+    done(err, user);
+  });
+});
+
+passport.use(new GoogleStrategy({
+  clientID: process.env.CLIENT_ID,
+  clientSecret: process.env.CLIENT_SECRET,
+  callbackURL: "http://localhost:3000/auth/google/secrets",
+  userProfileURL: "https://www.googleapis.com/oauth2/v3/userinfo",
+},
+  function(accessToken, refreshToken, profile, cb){
+    /*
+      accessToken - allows us to get data related to that user which allows us to access the user's data for a longer period of timeout
+      profile - contains their email, google id and anything else that we have access to
+    */
+    // console.log(profile);
+    User.findOrCreate({googleId: profile.id}, function(err, user){
+      return cb(err, user);
+    });
+  }
+));
+
 
 app.get("/", function(req, res){
   res.render("home");
 });
-
-app.get("/login", function(req, res){
-  res.render("login");
+// use passport to authenticate our user using the google strategy which we have set up above as a new strategy passing all of those things to help google recognize our app which we have set up in the dashboard
+// code use to login using google account
+app.get("/auth/google", passport.authenticate("google", {
+    scope: ["profile", "email"],
+  })
+);
+// response by the google when logging in using google account
+app.get("/auth/google/secrets", passport.authenticate("google", {
+  failureRedirect: "/login"
+}), function(req , res){
+  res.redirect("/secrets");
 });
 
-app.post("/login", function(req, res){
-  let userEmail = req.body.useremail;
-  let userPassword = req.body.password;
-
-  User.findOne({email: userEmail}, function(err, userFound){
-    if(!err){
-      if(userFound.password === userPassword){
-        res.render("secrets");
+app.route("/login")
+  .get(function(req, res){
+    res.render("login");
+  })
+  .post(function(req, res){
+    const user = new User({
+      username: req.body.username,
+      password: req.body.password,
+    });
+    req.login(user, function(err){
+      if(err){
+        console.log(err);
       }else{
-        res.send("incorrect password");
+        passport.authenticate("local")(req, res, function(err){
+          if(err){
+            console.log(err);
+            res.redirect("/login");
+          }else{
+            res.redirect("/secrets");
+          }
+        });
       }
-    }else{
-      console.log(err);
-    }
-  });
-});
-
-app.get("/register", function(req, res){
-  res.render("register");
-});
-
-app.post("/register", function(req, res){
-  let userEmail = req.body.useremail;
-  let userPassword = req.body.password;
-
-  const user = new User({
-    email: userEmail,
-    password: userPassword,
+    });
   });
 
-  user.save(function(err){
+app.route("/register")
+  .get(function(req, res){
+    res.render("register");
+  })
+  .post(function(req, res){
+    User.register({username: req.body.username}, req.body.password, function(err, user){
+      if(err){
+        console.log(err);
+        res.redirect("/register");
+      }else{
+        passport.authenticate("local")(req, res, function() {
+          res.redirect("/secrets");
+        });
+      }
+    });
+  });
+
+app.get("/secrets", function(req, res){
+  User.find({"secret": {$ne:null}}, function(err, foundUsers){
     if(err){
       console.log(err);
     }else{
-      res.render("secrets");
+      if(foundUsers){
+        res.render("secrets", {usersWithSecrets: foundUsers});
+      }
     }
+  });
+});
+
+app.get("/secrets", function(req, res){
+  if(req.isAuthenticated()){
+    res.render("secrets");
+  }else{
+    res.redirect("/login");
+  }
+});
+
+app.route("/submit")
+  .get(function(req, res){
+    if(req.isAuthenticated()){
+      res.render("submit");
+    }else{
+      res.render("/login");
+    }
+  })
+  .post(function(req, res){
+    const submittedSecret = req.body.secret;
+
+    User.findById(req.user.id, function(err, foundUser){
+      if(err){
+        console.log(err);
+      }else{
+        if(foundUser){
+          foundUser.secret = submittedSecret;
+          foundUser.save(function(){
+            res.redirect("/secrets");
+          });
+        }
+      }
+    });
+
   });
 
 
+app.get("/logout", function(req, res){
+  req.logout();
+  res.redirect("/");
 });
-
 
 app.listen(3000 || process.env.PORT, function(){
   console.log("The server is running on port 3000");
